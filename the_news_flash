@@ -1,0 +1,344 @@
+import json
+import re
+import os
+import json
+from datetime import datetime, timedelta
+from urllib.parse import urlparse
+
+HISTORY_DAYS = 365
+CUTOFF_DATE = datetime.now() - timedelta(days=HISTORY_DAYS)
+
+# ---------------------------------------------------------------------------
+# PARSING STRATEGY
+# ---------------------------------------------------------------------------
+# Read the entire file at once, then use re.finditer with re.MULTILINE to
+# locate every WhatsApp message header: [DD/MM/YY, HH:MM:SS] Sender:
+#
+# The body of message N = text from the end of header N to the start of
+# header N+1.  This is a hard timestamp boundary — content from one message
+# can never bleed into the next, regardless of invisible Unicode chars or
+# encoding quirks.
+# ---------------------------------------------------------------------------
+HEADER_RE = re.compile(
+    # Match the WhatsApp message header pattern.
+    # Uses (?:^|\n) to find headers at start-of-string or after a newline,
+    # then [^\n]* to skip any invisible chars (U+200E, BOM, ZWSP…) that
+    # WhatsApp may insert before the '[' bracket.
+    # The key difference from the previous version: we don't require the
+    # invisible chars to be "whitespace" — we allow any non-newline char.
+    r'(?:^|\n)[^\n\[]*'                   # line start + any non-newline, non-'[' chars
+    r'\[(\d{1,2}/\d{1,2}/\d{2,4}),'      # group 1: date  e.g. 26/02/26
+    r'\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*'  # group 2: time  e.g. 11:27:38
+    r'\]\s+'                              # ] + whitespace
+    r'[^:\n]+:\s*',                       # Sender: (no colon/newline in name)
+)
+
+
+NOISE_EMOJIS = ('👇', '👆', '☝️', '⬆️', '⬇️')
+
+
+def is_noise_block(text: str) -> bool:
+    """Returns True if the block's only meaningful content is a noise emoji.
+
+    Covers three cases:
+    1. Exact match after strip  (e.g. body = '👆')
+    2. Single very-short non-ASCII token  (single emoji variants)
+    3. Every non-empty line is a noise emoji  (handles WhatsApp reply wrappers
+       where the quoted line is followed by just '👆' on its own line)
+    """
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if stripped in NOISE_EMOJIS:
+        return True
+    if len(stripped) <= 4 and not stripped.isascii():
+        return True
+    # Check if every non-blank line is a noise emoji
+    non_blank = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
+    if non_blank and all(ln in NOISE_EMOJIS for ln in non_blank):
+        return True
+    return False
+
+
+def parse_timestamp(date_str: str, time_str: str):
+    """Convert WhatsApp date + time strings into a datetime, or None on failure."""
+    try:
+        year_part = date_str.split('/')[-1]
+        fmt = "%d/%m/%y %H:%M" if len(year_part) == 2 else "%d/%m/%Y %H:%M"
+        if time_str.count(':') == 2:
+            fmt += ":%S"
+        return datetime.strptime(f"{date_str} {time_str}", fmt)
+    except Exception:
+        return None
+
+
+def extract_news_data(body: str):
+    """Parse a raw message body into (title, summaries, link, comment, source)."""
+    title_match = re.search(r'\*(.*?)\*', body)
+    title = title_match.group(1).strip() if title_match else None
+
+    link_match = re.search(r'(https?://[^\s|]+)', body)
+    link = link_match.group(1) if link_match else None
+
+    source = ""
+    if link:
+        try:
+            source = urlparse(link).netloc.replace('www.', '')
+        except Exception:
+            source = "Source"
+
+    skip_terms = [
+        "image omitted", "video omitted", "document omitted",
+        "sticker omitted", "audio omitted", "<This message was edited>",
+        "Messages and calls are end-to-end", "joined using this group's invite link",
+        "This message was deleted"
+    ]
+
+    summaries = []
+    comments = []
+
+    for raw_line in body.split('\n'):
+        ln = raw_line.strip()
+        if not ln:
+            continue
+        if any(term in ln for term in skip_terms):
+            continue
+        if ln.startswith('>'):
+            summaries.append(ln.lstrip('>').strip())
+        elif title and ln.strip('*') == title:
+            continue
+        elif link and link in ln and len(ln) < len(link) + 5:
+            continue
+        else:
+            comments.append(ln)
+
+    comment_block = " ".join(comments).strip()
+    return title, summaries, link, comment_block, source
+
+
+def generate_html(content: str):
+
+    # Locate every message header in one pass
+    headers = list(HEADER_RE.finditer(content))
+    print(f"Messages found: {len(headers)}")
+    # Diagnostic: print first 5 headers to verify correct splitting
+    for dbg_i, dbg_h in enumerate(headers[:5]):
+        body_s = dbg_h.end()
+        body_e = headers[dbg_i+1].start() if dbg_i+1 < len(headers) else len(content)
+        preview = content[body_s:body_e].strip()[:60].replace('\n', ' ')
+        print(f"  [{dbg_h.group(1)}, {dbg_h.group(2)}] body: {preview!r}")
+
+
+    date_limit = CUTOFF_DATE.replace(hour=0, minute=0, second=0, microsecond=0)
+    news_items = []
+
+    for i, header in enumerate(headers):
+        msg_date = parse_timestamp(header.group(1), header.group(2))
+        if msg_date is None or msg_date < date_limit:
+            continue
+
+        # Strict body: from end of this header to start of the next
+        body_start = header.end()
+        body_end = headers[i + 1].start() if i + 1 < len(headers) else len(content)
+        body = content[body_start:body_end].strip()
+
+        if not body or is_noise_block(body):
+            continue
+
+        title, summaries, link, comment_block, source = extract_news_data(body)
+        has_content = title and (summaries or (comment_block and len(comment_block) > 0))
+        if has_content or link:
+            news_items.append({
+                'timestamp': msg_date,
+                'date_iso': msg_date.strftime("%Y-%m-%d"),
+                'title': title or "Update",
+                'summary': summaries,
+                'link': link,
+                'comment': comment_block,
+                'source': source,
+                'searchable': f"{title or ''} {' '.join(summaries)} {comment_block or ''} {source or ''}".lower()
+            })
+
+    print(f"News items kept: {len(news_items)}")
+
+    news_items.sort(key=lambda x: x['timestamp'], reverse=True)
+    for item in news_items:
+        del item['timestamp']
+
+    html_template = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IBBA The News Flash - The signal through the noise</title>
+    <link rel="icon" href="https://storage.googleapis.com/ba-public/codes/Logo/logo_itau_black.png" type="image/png">
+    <style>
+        * {{ box-sizing: border-box; }}
+        html, body {{ overflow-x: hidden; width: 100%; }}
+        body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 0; background: #f4f7f9; color: #333; font-size: 13.5px; }}
+        .header {{
+            background: #000; color: #ff8c00; padding: 10px 20px;
+            position: sticky; top: 0; z-index: 100;
+            display: flex; align-items: center; justify-content: center;
+            min-height: 50px; width: 100%;
+        }}
+        .header h1 {{ margin: 0; font-size: 1.3em; text-align: center; padding-right: 60px; }}
+        .logo-container {{ position: absolute; right: 15px; display: flex; align-items: center; height: 100%; top: 0; }}
+        .logo-itau {{ height: 38px; width: auto; border-radius: 4px; }}
+        .filters {{
+            background: #fff; padding: 10px; border-bottom: 2px solid #000;
+            display: flex; justify-content: center; gap: 10px; font-size: 0.9em; flex-wrap: wrap;
+        }}
+        input {{ padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 0.9em; max-width: 100%; }}
+        .container {{
+            max-width: 1600px; margin: 15px auto; padding: 0 15px; width: 100%;
+            display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; align-items: start;
+        }}
+        @media (max-width: 1000px) {{ .container {{ grid-template-columns: repeat(2, 1fr); }} }}
+        @media (max-width: 600px) {{
+            .container {{ grid-template-columns: 1fr; padding: 0 8px; gap: 10px; }}
+            .header {{ padding: 8px 50px 8px 12px; }}
+            .header h1 {{ font-size: 0.95em; padding-right: 0; }}
+            .logo-itau {{ height: 28px; }}
+            .logo-container {{ right: 10px; }}
+            .filters {{ padding: 8px; gap: 6px; font-size: 0.85em; }}
+            input {{ padding: 5px 8px; font-size: 0.85em; }}
+        }}
+        .card {{
+            background: white; padding: 12px; border-radius: 4px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1); border-left: 4px solid #000;
+            display: flex; flex-direction: column; box-sizing: border-box;
+            height: 240px; overflow: hidden;
+        }}
+        .card.expanded {{
+            height: auto; overflow: visible;
+        }}
+        .meta-header {{ display: flex; gap: 6px; align-items: baseline; font-size: 0.75em; margin-bottom: 6px; }}
+        .date-label {{ font-weight: bold; color: #ff8c00; }}
+        .source-label {{ color: #666; font-style: italic; text-decoration: none; }}
+        .source-label:hover {{ text-decoration: underline; color: #ff8c00; }}
+        .title {{ font-size: 1em; font-weight: bold; color: #000; margin: 0 0 8px 0; line-height: 1.25; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }}
+        .content-body {{ flex-grow: 1; overflow: hidden; position: relative; }}
+        .content-body.collapsed {{
+            max-height: 130px;
+            mask-image: linear-gradient(to bottom, black 80%, transparent 100%);
+            -webkit-mask-image: linear-gradient(to bottom, black 80%, transparent 100%);
+        }}
+        .read-more-btn {{ display: block; margin-top: 8px; color: #ff8c00; cursor: pointer; font-weight: bold; background: none; border: none; padding: 0; text-decoration: underline; text-align: left; font-size: 0.85em; }}
+        .summary {{ color: #555; margin: 4px 0; padding-left: 8px; border-left: 3px solid #ccc; font-size: 0.88em; line-height: 1.4; }}
+        .commentary {{ background: #f9f9f9; padding: 8px; border: 1px dashed #ccc; margin: 8px 0; font-size: 0.88em; }}
+        .link {{ display: inline-block; margin-top: 8px; color: #000; text-decoration: underline; font-weight: bold; font-size: 0.8em; }}
+        .load-more-container {{ text-align: center; margin: 20px 0 40px; }}
+        .btn-load-more {{ background: #000; color: #fff; border: none; padding: 10px 30px; border-radius: 4px; cursor: pointer; font-weight: bold; display: none; }}
+        .btn-load-more:hover {{ background: #ff8c00; }}
+        .status-info {{ text-align: center; font-size: 0.9em; color: #666; margin-bottom: 10px; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>IBBA The News Flash - The signal through the noise</h1>
+        <div class="logo-container">
+            <img src="https://storage.googleapis.com/ba-public/codes/Logo/logo_itau_black.png" alt="Itaú" class="logo-itau">
+        </div>
+    </div>
+    <div class="filters">
+        <div>📅 Start: <input type="date" id="dateStart"></div>
+        <div>📅 End: <input type="date" id="dateEnd"></div>
+        <div>🔍 Search: <input type="text" id="searchText" placeholder="Search news..."></div>
+    </div>
+    <div class="status-info" id="statusInfo"></div>
+    <div class="container" id="newsList"></div>
+    <div class="load-more-container">
+        <button class="btn-load-more" id="btnLoadMore" onclick="loadMore()">Load More News</button>
+    </div>
+    <script>
+        const allNews = {json.dumps(news_items, ensure_ascii=False)};
+        let filtered = [];
+        let rendered = 0;
+        const PAGE_SIZE = 24;
+        let searchTimeout;
+
+        function applyFilters() {{
+            const start = document.getElementById('dateStart').value;
+            const end = document.getElementById('dateEnd').value;
+            const query = document.getElementById('searchText').value.toLowerCase().trim();
+            filtered = allNews.filter(n => {{
+                const okDate = (!start || n.date_iso >= start) && (!end || n.date_iso <= end);
+                const okText = !query || n.searchable.includes(query);
+                return okDate && okText;
+            }});
+            rendered = 0;
+            document.getElementById('newsList').innerHTML = '';
+            document.getElementById('statusInfo').textContent =
+                `Showing ${{filtered.length}} of ${{allNews.length}} news items`;
+            renderBatch();
+        }}
+
+        function renderBatch() {{
+            const container = document.getElementById('newsList');
+            const batch = filtered.slice(rendered, rendered + PAGE_SIZE);
+            batch.forEach((n, i) => {{
+                const idx = rendered + i;
+                const dateFormatted = n.date_iso.split('-').reverse().join('/');
+                const sourceHtml = n.source
+                    ? (n.link
+                        ? `<a href="${{n.link}}" target="_blank" class="source-label">| ${{n.source}}</a>`
+                        : `<span class="source-label">| ${{n.source}}</span>`)
+                    : '';
+                const summaryHtml = (n.summary || []).map(s => `<div class="summary">• ${{s}}</div>`).join('');
+                const commentHtml = (n.comment && n.comment.trim())
+                    ? `<div class="commentary">${{n.comment}}</div>` : '';
+                const linkHtml = n.link
+                    ? `<a class="link" href="${{n.link}}" target="_blank">Read full story →</a>` : '';
+                const card = document.createElement('div');
+                card.className = 'card';
+                card.id = `card-${{idx}}`;
+                card.innerHTML = `
+                    <div class="meta-header">
+                        <span class="date-label">${{dateFormatted}}</span>${{sourceHtml}}
+                    </div>
+                    <div class="title">${{n.title}}</div>
+                    <div class="content-body collapsed">
+                        ${{commentHtml}}
+                        ${{summaryHtml}}
+                        ${{linkHtml}}
+                    </div>
+                    <button class="read-more-btn" onclick="toggleExpand(this)">Read more</button>
+                `;
+                container.appendChild(card);
+            }});
+            rendered += batch.length;
+            document.getElementById('btnLoadMore').style.display =
+                (rendered < filtered.length) ? 'inline-block' : 'none';
+        }}
+
+        function loadMore() {{ renderBatch(); }}
+
+        function toggleExpand(btn) {{
+            const card = btn.closest('.card');
+            const content = btn.previousElementSibling;
+            if (content.classList.contains('collapsed')) {{
+                content.classList.remove('collapsed');
+                card.classList.add('expanded');
+                btn.textContent = "Read less";
+            }} else {{
+                content.classList.add('collapsed');
+                card.classList.remove('expanded');
+                btn.textContent = "Read more";
+                card.scrollIntoView({{ behavior: 'smooth', block: 'nearest' }});
+            }}
+        }}
+
+        document.getElementById('dateStart').addEventListener('change', applyFilters);
+        document.getElementById('dateEnd').addEventListener('change', applyFilters);
+        document.getElementById('searchText').addEventListener('input', () => {{
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(applyFilters, 300);
+        }});
+
+        applyFilters();
+    </script>
+</body>
+</html>
+"""
+    return html_template
