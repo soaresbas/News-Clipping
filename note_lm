@@ -1,0 +1,327 @@
+"""
+parse_news.py
+-------------
+Reads the WhatsApp group export (wpp_historical.txt) and produces a
+clean text file (news_source_note_lm.txt) suitable for uploading to NotebookLM.
+
+For each news item the output keeps:
+  - DATA    (DD/MM/YYYY)
+  - TÍTULO  (bold *...* text)
+  - COMENTÁRIO DO CURADOR  (curator's own sentences)
+  - DESTAQUE               (block-quote excerpts from the article)
+  - LINK    (first valid URL)
+
+Handles two message types:
+  1. Simple: one *Title* + text + URL
+  2. Digest: a list of sub-items, each starting with  - *Title* \n URL
+"""
+
+import re
+from pathlib import Path
+from collections import defaultdict
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Regex helpers
+# ---------------------------------------------------------------------------
+# WhatsApp message header  [DD/MM/YY, HH:MM:SS] Sender Name: body…
+HEADER_RE = re.compile(
+    r"^\[(\d{2}/\d{2}/\d{2,4}),\s*\d{2}:\d{2}:\d{2}\]\s*~?\s*[^:]+:\s*(.*)",
+    re.DOTALL,
+)
+
+# Bold title  *Title Text*
+TITLE_RE = re.compile(r"\*([^*]+)\*")
+
+# URL
+URL_RE = re.compile(
+    r"https?://[^\s\u200e\u200f\u202a-\u202e\ufeff<>\"\']+",
+)
+
+# Lines to skip outright (system messages, blank lines)
+SKIP_PATTERNS = [
+    re.compile(r"\u200e?image omitted", re.I),
+    re.compile(r"\u200e?video omitted", re.I),
+    re.compile(r"\u200e?sticker omitted", re.I),
+    re.compile(r"\u200e?This message was (deleted|edited)", re.I),
+    re.compile(r"pinned a message", re.I),
+    re.compile(r"Messages and calls are end-to-end", re.I),
+    re.compile(r"created the community", re.I),
+    re.compile(r"This chat has added privacy", re.I),
+    re.compile(r"^Welcome to the community", re.I),
+    re.compile(r"^\s*$"),      # blank lines
+]
+
+# URLs to exclude (internal events, social links without article content)
+SKIP_URL_FRAGMENTS = [
+    "zoom.us/meeting",
+    "zoom.us/j/",
+    "zoom.us/wc/",
+    "itau.zoom.us",
+    "itau.com.br/itaubba",
+    "forms.office.com",
+    "image omitted",
+    "truthsocial.com/@real",
+]
+
+# Wrapper/digest header titles that should be dropped if they have no news link
+WRAPPER_TITLE_RE = re.compile(
+    r"(wrapping up|resumo do dia|destaques do dia|highlights|kick.?off|monthly|bom dia|boa tarde|boa noite)",
+    re.I,
+)
+
+# Patterns that indicate a whole record is just an event/meeting announcement
+EVENT_TITLE_RE = re.compile(
+    r"(reuni[aã]o|evento|meeting|webinar|happy hour|acesse o link|para participar"
+    r"|segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado|domingo"
+    r"|janeiro|fevereiro|mar[cç]o|abril|maio|junho|julho|agosto"
+    r"|setembro|outubro|novembro|dezembro)",
+    re.I,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def parse_date(raw: str) -> str:
+    """Convert DD/MM/YY → DD/MM/YYYY."""
+    parts = raw.split("/")
+    if len(parts) == 3 and len(parts[2]) == 2:
+        parts[2] = "20" + parts[2]
+    return "/".join(parts)
+
+
+def strip_invisible(text: str) -> str:
+    """Remove WhatsApp invisible / directional characters."""
+    return re.sub(r"[\u200e\u200f\u202a-\u202e\ufeff\u2069\u2066\u2068\u200b]", "", text)
+
+
+def should_skip_line(line: str) -> bool:
+    return any(p.search(line) for p in SKIP_PATTERNS)
+
+
+def is_good_url(url: str) -> bool:
+    return not any(s in url for s in SKIP_URL_FRAGMENTS)
+
+
+def best_url(urls: list) -> str | None:
+    good = [u for u in urls if is_good_url(u)]
+    return good[0] if good else (urls[0] if urls else None)
+
+
+def clean_text(text: str) -> str:
+    """Strip invisible chars, remove inline URLs, collapse spaces."""
+    text = strip_invisible(text)
+    text = URL_RE.sub("", text)
+    text = re.sub(r" {2,}", " ", text).strip()
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Split a single message body into sub-items (for digest messages)
+# ---------------------------------------------------------------------------
+
+def split_body_into_subitems(body: str) -> list[dict]:
+    """
+    A message may be a digest containing multiple sub-articles.
+    Each sub-article starts with  '- *Title*'  or just  '*Title*'  at the
+    start of a line, followed by a URL and optional block-quotes/comments.
+
+    Returns a list of dicts:
+        {title, curator_lines, quote_lines, urls}
+    If the message has only one item (or no clear structure) returns one dict.
+    """
+    lines = body.split("\n")
+    subitems = []
+    current: dict | None = None
+
+    for raw_line in lines:
+        line = strip_invisible(raw_line).strip()
+
+        if should_skip_line(line):
+            continue
+
+        # Detect start of a new sub-item: line starts with optional "- " then *Title*
+        stripped = line.lstrip("- ").strip()
+        title_match = TITLE_RE.fullmatch(stripped)
+
+        if title_match:
+            # Save previous sub-item
+            if current is not None:
+                subitems.append(current)
+            title_text = title_match.group(1).strip()
+            current = {
+                "title": title_text,
+                "curator_lines": [],
+                "quote_lines": [],
+                "urls": [],
+            }
+            continue
+
+        if current is None:
+            # No sub-item started yet — treat as a pre-amble item
+            current = {
+                "title": None,
+                "curator_lines": [],
+                "quote_lines": [],
+                "urls": [],
+            }
+
+        # Block-quote line
+        if line.startswith(">"):
+            q = line.lstrip("> ").strip()
+            q = clean_text(q)
+            if q:
+                current["quote_lines"].append(q)
+            continue
+
+        # Pure URL line
+        urls_in_line = URL_RE.findall(line)
+        if urls_in_line and clean_text(line) == "":
+            current["urls"].extend(urls_in_line)
+            continue
+
+        # Mixed line with URL + text, or pure text
+        current["urls"].extend(urls_in_line)
+        plain = TITLE_RE.sub(r"\1", line)   # remove bold markers
+        plain = clean_text(plain)
+        if plain:
+            current["curator_lines"].append(plain)
+
+    if current is not None:
+        subitems.append(current)
+
+    return subitems
+
+
+# ---------------------------------------------------------------------------
+# Parse raw file into (date, body) messages
+# ---------------------------------------------------------------------------
+
+def split_into_messages(content: str) -> list[tuple[str, str]]:
+    """
+    Split the raw file into (date, full_body) tuples, one per WhatsApp message.
+    """
+    messages = []
+    current_date = None
+    current_body_lines = []
+
+    for raw_line in content.splitlines():
+        line = strip_invisible(raw_line.rstrip("\r\n"))
+        m = HEADER_RE.match(line)
+        if m:
+            if current_date and current_body_lines:
+                messages.append((current_date, "\n".join(current_body_lines)))
+            raw_date = m.group(1)
+            current_date = parse_date(raw_date)
+            current_body_lines = [m.group(2)]
+        else:
+            if current_date:
+                current_body_lines.append(line)
+
+    if current_date and current_body_lines:
+        messages.append((current_date, "\n".join(current_body_lines)))
+
+    return messages
+
+
+# ---------------------------------------------------------------------------
+# Build final records from a message
+# ---------------------------------------------------------------------------
+
+def message_to_records(date: str, body: str) -> list[dict]:
+    """
+    Convert a single WhatsApp message into one or more news record dicts.
+    Returns [] if this is clearly not a news message.
+    """
+    body_clean = strip_invisible(body)
+    all_urls   = URL_RE.findall(body_clean)
+
+    # Quick pre-filter: skip if no URL and no bold title at all
+    has_title = bool(TITLE_RE.search(body_clean))
+    has_url   = bool(all_urls)
+    if not has_title and not has_url:
+        return []
+
+    subitems = split_body_into_subitems(body)
+    records  = []
+
+    for item in subitems:
+        title   = (item["title"] or "").strip()
+        curator = " ".join(item["curator_lines"]).strip()
+        quotes  = item["quote_lines"]
+        link    = best_url(item["urls"])
+
+        # Skip items with no link AND no meaningful title or content
+        if not link and not title:
+            continue
+        # Skip very short titles
+        if title and len(title) < 4:
+            continue
+        # Skip wrapper/digest header rows (e.g. 'Wrapping up the day') that have no proper link
+        if not link and title and WRAPPER_TITLE_RE.search(title):
+            continue
+        # Skip wrapper/event-only items: no good link AND title is an event notice
+        if not link and title and EVENT_TITLE_RE.search(title):
+            continue
+        # Skip if only link is zoom/itau-internal/forms (no real news content)
+        if link and not is_good_url(link):
+            continue
+
+        # Remove curator text that's just the title repeated
+        title_lower = title.lower()
+        clean_curator_parts = [
+            p for p in item["curator_lines"]
+            if p.lower().strip() != title_lower
+        ]
+        curator = " ".join(clean_curator_parts).strip()
+
+        records.append({
+            "date":    date,
+            "title":   title or "(sem título)",
+            "curator": curator,
+            "quotes":  quotes,
+            "link":    link or "",
+        })
+
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Format a single record as text
+# ---------------------------------------------------------------------------
+
+def format_record(rec: dict) -> str:
+    parts = [f"DATE: {rec['date']}"]
+    parts.append(f"TITLE: {rec['title']}")
+
+    if rec["curator"]:
+        parts.append(f"COMMENT: {rec['curator']}")
+
+    if rec["quotes"]:
+        # Compact multiline block for article excerpts
+        excerpt_block = "\n    ".join(rec["quotes"])
+        parts.append(f"HIGHLIGHT:\n    {excerpt_block}")
+
+    if rec["link"]:
+        parts.append(f"LINK: {rec['link']}")
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def generate_notelm_text(content: str) -> str:
+    messages = split_into_messages(content)
+    records = []
+    for date, body in messages:
+        recs = message_to_records(date, body)
+        if recs:
+            records.extend(recs)
+    return "\n\n---\n\n".join(format_record(r) for r in records)
